@@ -1,0 +1,50 @@
+name: NBIS DUCK Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Voir CPU RAM disque
+        run: |
+          echo "=== CPU ==="
+          nproc
+          echo "=== RAM ==="
+          free -h
+          echo "=== RAM totale ==="
+          grep MemTotal /proc/meminfo
+          echo "=== DISQUE ==="
+          df -h /
+
+      - name: Installer DuckDB
+        run: |
+          python -m pip install --quiet duckdb
+
+      - name: Tester DuckDB
+        run: |
+          python - <<'PY'
+          import duckdb
+          import time
+
+          con = duckdb.connect()
+          debut = time.time()
+
+          resultat = con.execute("""
+              SELECT
+                  i % 1000 AS groupe,
+                  COUNT(*) AS n,
+                  AVG(SIN(i::DOUBLE)) AS moyenne
+              FROM range(5000000) t(i)
+              GROUP BY 1
+          """).fetchall()
+
+          print("DUCK_SMOKE_TEST_V1=PASS")
+          print("lignes =", len(resultat))
+          print("temps_secondes =", round(time.time() - debut, 3))
+          PY
