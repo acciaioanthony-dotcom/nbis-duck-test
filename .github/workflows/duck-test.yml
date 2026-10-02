@@ -5,11 +5,15 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 21-23,0-6 * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
   id-token: write
+
+concurrency:
+  group: nbis-duck-research
+  cancel-in-progress: false
 
 jobs:
   worker:
@@ -39,7 +43,8 @@ jobs:
           gcloud storage cp "$B/jobs/current/input.parquet" /tmp/input.parquet
 
           python -m pip install --quiet duckdb
-          python /tmp/job.py /tmp/input.parquet /tmp/result.json
+
+          python /tmp/job.py /tmp/input.parquet /tmp/result.json >/tmp/job-run.log 2>&1
 
           gcloud storage cp /tmp/result.json "$B/jobs/current/result.json"
           gcloud storage rm "$B/jobs/current/PENDING"
@@ -47,4 +52,4 @@ jobs:
           echo "DONE" > /tmp/DONE
           gcloud storage cp /tmp/DONE "$B/jobs/current/DONE"
 
-          cat /tmp/result.json
+          echo "NBIS_DUCK_JOB=PASS"
