@@ -1,22 +1,23 @@
-name: NBIS GitHub Google Bridge
+name: NBIS DUCK Worker
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 21-23,0-6 * * *'
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  test:
+  worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Connexion Google sans clé
+      - name: Connexion Google
         uses: google-github-actions/auth@v3
         with:
           project_id: project-e8cb129e-ffe0-4624-98b
@@ -25,17 +26,25 @@ jobs:
       - name: Installer gcloud
         uses: google-github-actions/setup-gcloud@v3
 
-      - name: Test GitHub vers bucket
+      - name: Worker DUCK
         run: |
-          echo "NBIS_GITHUB_TO_GCS_PASS" > /tmp/github-test.txt
-          gcloud storage cp /tmp/github-test.txt gs://nbis-github-research-806064245872/github-probe/hello.txt
-          gcloud storage cat gs://nbis-github-research-806064245872/github-probe/hello.txt
+          B=gs://nbis-github-research-806064245872
 
-      - name: Test DuckDB
-        run: |
+          if ! gcloud storage ls "$B/jobs/current/PENDING" >/dev/null 2>&1; then
+            echo "NO_JOB"
+            exit 0
+          fi
+
+          gcloud storage cp "$B/jobs/current/job.py" /tmp/job.py
+          gcloud storage cp "$B/jobs/current/input.parquet" /tmp/input.parquet
+
           python -m pip install --quiet duckdb
-          python - <<'PY'
-          import duckdb
-          print(duckdb.sql("SELECT 42 AS test").fetchall())
-          print("DUCK_GITHUB_GCS_BRIDGE=PASS")
-          PY
+          python /tmp/job.py /tmp/input.parquet /tmp/result.json
+
+          gcloud storage cp /tmp/result.json "$B/jobs/current/result.json"
+          gcloud storage rm "$B/jobs/current/PENDING"
+
+          echo "DONE" > /tmp/DONE
+          gcloud storage cp /tmp/DONE "$B/jobs/current/DONE"
+
+          cat /tmp/result.json
