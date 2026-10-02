@@ -1,50 +1,41 @@
-name: NBIS DUCK Test
+name: NBIS GitHub Google Bridge
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
-      - name: Voir CPU RAM disque
-        run: |
-          echo "=== CPU ==="
-          nproc
-          echo "=== RAM ==="
-          free -h
-          echo "=== RAM totale ==="
-          grep MemTotal /proc/meminfo
-          echo "=== DISQUE ==="
-          df -h /
+      - uses: actions/checkout@v4
 
-      - name: Installer DuckDB
+      - name: Connexion Google sans clé
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: project-e8cb129e-ffe0-4624-98b
+          workload_identity_provider: projects/806064245872/locations/global/workloadIdentityPools/nbis-github/providers/github-nbis
+
+      - name: Installer gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Test GitHub vers bucket
+        run: |
+          echo "NBIS_GITHUB_TO_GCS_PASS" > /tmp/github-test.txt
+          gcloud storage cp /tmp/github-test.txt gs://nbis-github-research-806064245872/github-probe/hello.txt
+          gcloud storage cat gs://nbis-github-research-806064245872/github-probe/hello.txt
+
+      - name: Test DuckDB
         run: |
           python -m pip install --quiet duckdb
-
-      - name: Tester DuckDB
-        run: |
           python - <<'PY'
           import duckdb
-          import time
-
-          con = duckdb.connect()
-          debut = time.time()
-
-          resultat = con.execute("""
-              SELECT
-                  i % 1000 AS groupe,
-                  COUNT(*) AS n,
-                  AVG(SIN(i::DOUBLE)) AS moyenne
-              FROM range(5000000) t(i)
-              GROUP BY 1
-          """).fetchall()
-
-          print("DUCK_SMOKE_TEST_V1=PASS")
-          print("lignes =", len(resultat))
-          print("temps_secondes =", round(time.time() - debut, 3))
+          print(duckdb.sql("SELECT 42 AS test").fetchall())
+          print("DUCK_GITHUB_GCS_BRIDGE=PASS")
           PY
