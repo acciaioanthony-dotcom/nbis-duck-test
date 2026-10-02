@@ -2,8 +2,6 @@ name: NBIS DUCK Worker
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
   schedule:
     - cron: '*/5 * * * *'
 
@@ -21,35 +19,334 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Connexion Google
-        uses: google-github-actions/auth@v3
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Connexion Google - entree
+        id: auth_in
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
         with:
           project_id: project-e8cb129e-ffe0-4624-98b
           workload_identity_provider: projects/806064245872/locations/global/workloadIdentityPools/nbis-github/providers/github-nbis
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Installer gcloud
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
 
-      - name: Worker DUCK
+      - name: Verifier les frontieres Google
+        shell: bash
         run: |
+          set -euo pipefail
+
+          if gcloud storage ls gs://nbis-data-v1-806064245872 >/dev/null 2>&1; then
+            echo "::error::SECURITY_FAIL: GitHub peut acceder au bucket LIVE"
+            exit 81
+          fi
+
+          if gcloud projects get-iam-policy project-e8cb129e-ffe0-4624-98b \
+            --format='value(version)' >/dev/null 2>&1; then
+            echo "::error::SECURITY_FAIL: GitHub peut lire IAM du projet"
+            exit 82
+          fi
+
+          echo "GCP_BOUNDARY_CHECK=PASS"
+
+      - name: Chercher un travail et verifier le paquet
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+
           B=gs://nbis-github-research-806064245872
 
           if ! gcloud storage ls "$B/jobs/current/PENDING" >/dev/null 2>&1; then
+            echo "has_job=false" >> "$GITHUB_OUTPUT"
             echo "NO_JOB"
             exit 0
           fi
 
+          echo "has_job=true" >> "$GITHUB_OUTPUT"
+
+          gcloud storage cp "$B/jobs/current/PENDING" /tmp/PENDING
+          gcloud storage cp "$B/jobs/current/manifest.json" /tmp/manifest.json
           gcloud storage cp "$B/jobs/current/job.py" /tmp/job.py
-          gcloud storage cp "$B/jobs/current/input.parquet" /tmp/input.parquet
+          gcloud storage cp "$B/jobs/current/bundle.tar.gz" /tmp/nbis-bundle.tar.gz
 
-          python -m pip install --quiet duckdb
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
 
-          python /tmp/job.py /tmp/input.parquet /tmp/result.json >/tmp/job-run.log 2>&1
+          m = json.load(open('/tmp/manifest.json'))
+          pending = pathlib.Path('/tmp/PENDING').read_text().strip()
 
-          gcloud storage cp /tmp/result.json "$B/jobs/current/result.json"
+          def digest(path):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
+
+          assert pending == m['task_id'], 'pending_manifest_task_mismatch'
+          assert digest('/tmp/job.py') == m['job_sha256'], 'job_sha256_mismatch'
+          assert digest('/tmp/nbis-bundle.tar.gz') == m['bundle_sha256'], 'bundle_sha256_mismatch'
+          assert m.get('security_profile') == 'ISOLATED_NO_CLOUD_CREDS_NO_NETWORK', 'security_profile_missing'
+
+          print('PACKAGE_INTEGRITY=PASS')
+          PY
+
+      - name: Preparer utilisateur RD sans privileges
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! id -u nbisresearch >/dev/null 2>&1; then
+            sudo useradd \
+              --system \
+              --create-home \
+              --user-group \
+              --shell /usr/sbin/nologin \
+              nbisresearch
+          fi
+
+          sudo mkdir -p /home/nbis-agent/NBIS_DATA_V1
+          sudo chown -R nbisresearch:nbisresearch /home/nbis-agent
+
+      - name: Preparer Python RD
+        if: steps.fetch.outputs.has_job == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m venv --system-site-packages /tmp/nbis-venv
+          /tmp/nbis-venv/bin/python -m pip install --quiet duckdb
+
+          chmod -R a+rX /tmp/nbis-venv
+          chmod 0644 \
+            /tmp/PENDING \
+            /tmp/job.py \
+            /tmp/manifest.json \
+            /tmp/nbis-bundle.tar.gz
+
+      - name: Detruire les identifiants cloud avant calcul
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for v in \
+            GOOGLE_GHA_CREDS_PATH \
+            GOOGLE_APPLICATION_CREDENTIALS \
+            CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
+          do
+            p="${!v:-}"
+            if [ -n "$p" ] && [ -f "$p" ]; then
+              rm -f "$p"
+            fi
+          done
+
+          find "$GITHUB_WORKSPACE" "$RUNNER_TEMP" \
+            -maxdepth 4 \
+            -type f \
+            -name 'gha-creds-*.json' \
+            -delete 2>/dev/null || true
+
+          if find "$GITHUB_WORKSPACE" "$RUNNER_TEMP" \
+            -maxdepth 4 \
+            -type f \
+            -name 'gha-creds-*.json' \
+            2>/dev/null | grep -q .
+          then
+            echo "::error::SECURITY_FAIL: credential file remains visible"
+            exit 83
+          fi
+
+          echo "CLOUD_CREDENTIAL_ERASURE=PASS"
+
+      - name: Verifier isolement reseau et privileges
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UID_R="$(id -u nbisresearch)"
+
+          sudo iptables -I OUTPUT 1 \
+            -m owner --uid-owner "$UID_R" \
+            -o lo -j ACCEPT
+
+          sudo iptables -I OUTPUT 2 \
+            -m owner --uid-owner "$UID_R" \
+            -j REJECT
+
+          if command -v ip6tables >/dev/null 2>&1; then
+            sudo ip6tables -I OUTPUT 1 \
+              -m owner --uid-owner "$UID_R" \
+              -o lo -j ACCEPT
+
+            sudo ip6tables -I OUTPUT 2 \
+              -m owner --uid-owner "$UID_R" \
+              -j REJECT
+          fi
+
+          if sudo -u nbisresearch sudo -n true >/dev/null 2>&1; then
+            echo "::error::SECURITY_FAIL: research user has sudo"
+            exit 84
+          fi
+
+          if sudo -u nbisresearch env -i \
+            PATH=/usr/bin:/bin \
+            HOME=/home/nbisresearch \
+            /usr/bin/python3 - <<'PY'
+          import socket
+          import sys
+
+          s = socket.socket()
+          s.settimeout(2)
+
+          try:
+              s.connect(('1.1.1.1', 443))
+              sys.exit(0)
+          except OSError:
+              sys.exit(1)
+          finally:
+              s.close()
+          PY
+          then
+            echo "::error::SECURITY_FAIL: research user still has outbound network"
+            exit 85
+          fi
+
+          echo "RESEARCH_NETWORK=BLOCKED"
+          echo "RESEARCH_SUDO=BLOCKED"
+
+      - name: Executer RD isolee
+        if: steps.fetch.outputs.has_job == 'true'
+        shell: bash
+        env:
+          GOOGLE_GHA_CREDS_PATH: ""
+          GOOGLE_APPLICATION_CREDENTIALS: ""
+          CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: ""
+          GITHUB_TOKEN: ""
+        run: |
+          set -euo pipefail
+
+          sudo -u nbisresearch env -i \
+            PATH=/tmp/nbis-venv/bin:/usr/bin:/bin \
+            HOME=/home/nbisresearch \
+            LANG=C.UTF-8 \
+            NBIS_NO_TRADING=1 \
+            DUCK_MEMORY_LIMIT_MB=8192 \
+            /tmp/nbis-venv/bin/python \
+            /tmp/job.py \
+            /tmp/nbis-bundle.tar.gz \
+            /tmp/result.json \
+            >/tmp/job-run.log 2>&1
+
+          test -s /tmp/result.json
+
+          echo "RESEARCH_ISOLATED_EXECUTION=PASS"
+
+      - name: Connexion Google - retour
+        id: auth_out
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          project_id: project-e8cb129e-ffe0-4624-98b
+          workload_identity_provider: projects/806064245872/locations/global/workloadIdentityPools/nbis-github/providers/github-nbis
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Valider le worker securise
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          B=gs://nbis-github-research-806064245872
+
+          printf 'PASS worker-isolation-v2\n' \
+            >/tmp/worker-security-pass
+
+          gcloud storage cp \
+            /tmp/worker-security-pass \
+            "$B/security/worker-isolation-v2/PASS"
+
+          echo "WORKER_SECURITY_V2=PASS"
+
+      - name: Renvoyer uniquement les sorties autorisees
+        if: steps.fetch.outputs.has_job == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          B = 'gs://nbis-github-research-806064245872'
+          BASE = pathlib.Path('/home/nbis-agent/NBIS_DATA_V1').resolve()
+
+          d = json.load(open('/tmp/result.json'))
+
+          for ent in d.get('expected_outputs') or []:
+              if not ent.get('exists'):
+                  continue
+
+              p = pathlib.Path(ent['path']).resolve()
+
+              if BASE not in (p, *p.parents):
+                  raise SystemExit('output_outside_base')
+
+              obj = str(ent.get('gcs_object') or '')
+
+              if not obj.startswith('jobs/current/outputs/'):
+                  raise SystemExit('invalid_output_object')
+
+              subprocess.run(
+                  ['gcloud', 'storage', 'cp', str(p), f'{B}/{obj}'],
+                  check=True
+              )
+
+          subprocess.run(
+              [
+                  'gcloud',
+                  'storage',
+                  'cp',
+                  '/tmp/result.json',
+                  f'{B}/jobs/current/result.json'
+              ],
+              check=True
+          )
+          PY
+
+          B=gs://nbis-github-research-806064245872
+
           gcloud storage rm "$B/jobs/current/PENDING"
 
-          echo "DONE" > /tmp/DONE
-          gcloud storage cp /tmp/DONE "$B/jobs/current/DONE"
+          printf 'DONE\n' >/tmp/DONE
+
+          gcloud storage cp \
+            /tmp/DONE \
+            "$B/jobs/current/DONE"
 
           echo "NBIS_DUCK_JOB=PASS"
+
+      - name: Nettoyage identifiants
+        if: always()
+        shell: bash
+        run: |
+          for v in \
+            GOOGLE_GHA_CREDS_PATH \
+            GOOGLE_APPLICATION_CREDENTIALS \
+            CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
+          do
+            p="${!v:-}"
+            if [ -n "$p" ] && [ -f "$p" ]; then
+              rm -f "$p"
+            fi
+          done
+
+          find "$GITHUB_WORKSPACE" "$RUNNER_TEMP" \
+            -maxdepth 4 \
+            -type f \
+            -name 'gha-creds-*.json' \
+            -delete 2>/dev/null || true
